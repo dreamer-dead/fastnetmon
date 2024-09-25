@@ -7,6 +7,7 @@
 #include "../fastnetmon_configuration_scheme.hpp"
 
 #include <vector>
+#include <string_view>
 
 extern log4cpp::Category& logger;
 
@@ -16,7 +17,18 @@ extern fastnetmon_configuration_t fastnetmon_global_configuration;
 bool push_hosts_traffic_counters_to_graphite() {
     extern abstract_subnet_counters_t<uint32_t, subnet_counter_t> ipv4_host_counters;
 
-    std::vector<direction_t> processed_directions = { INCOMING, OUTGOING };
+    // Construst a way to read counters from `subnet_counter_t` 
+    // for every traffic direction without runtime dispatch
+    const struct {
+        const direction_t direction;
+        const char* const direction_name;
+        uint64_t traffic_counter_element_t::* const packets_ptr;
+        uint64_t traffic_counter_element_t::* const bytes_ptr;
+        uint64_t subnet_counter_t::* const flows_ptr;
+    } processed_directions[2] = {
+        {INCOMING, "incoming", &traffic_counter_element_t::in_packets, &traffic_counter_element_t::in_bytes, &subnet_counter_t::in_flows},
+        {OUTGOING, "outgoing", &traffic_counter_element_t::out_packets, &traffic_counter_element_t::out_bytes, &subnet_counter_t::out_flows},
+    };
 
     graphite_data_t graphite_data;
 
@@ -24,8 +36,6 @@ bool push_hosts_traffic_counters_to_graphite() {
     ipv4_host_counters.get_all_non_zero_average_speed_elements_as_pairs(speed_elements);
 
     for (const auto& speed_element : speed_elements) {
-        std::string client_ip_as_string = convert_ip_as_uint_to_string(speed_element.first);
-
         const subnet_counter_t* current_speed_element = &speed_element.second;
 
         // Skip elements with zero speed
@@ -33,54 +43,33 @@ bool push_hosts_traffic_counters_to_graphite() {
             continue;
         }
 
-        std::string ip_as_string_with_dash_delimiters = client_ip_as_string;
+        std::string client_ip_as_string = convert_ip_as_uint_to_string(speed_element.first);
         // Replace dots by dashes
-        std::replace(ip_as_string_with_dash_delimiters.begin(), ip_as_string_with_dash_delimiters.end(), '.', '_');
+        std::replace(client_ip_as_string.begin(), client_ip_as_string.end(), '.', '_');
+
+        // Concatenate prefix parts without too many reallocations.
+        std::string graphite_ip_prefix = fastnetmon_global_configuration.graphite_prefix;
+        graphite_ip_prefix += ".hosts.";
+        graphite_ip_prefix += ip_as_string_with_dash_delimiters;
+        graphite_ip_prefix += '.';
 
         for (auto data_direction : processed_directions) {
-            std::string direction_as_string;
+            const std::string graphite_current_prefix = graphite_ip_prefix + direction_as_string;
 
-            if (data_direction == INCOMING) {
-                direction_as_string = "incoming";
-            } else if (data_direction == OUTGOING) {
-                direction_as_string = "outgoing";
+            const auto packets = current_speed_element->total.*data_direction.packets_ptr;
+            // We do not store zero data to Graphite
+            if (packets != 0) {
+                graphite_data[graphite_current_prefix + ".pps"] = packets;
             }
 
-            std::string graphite_current_prefix = fastnetmon_global_configuration.graphite_prefix + ".hosts." +
-                                                  ip_as_string_with_dash_delimiters + "." + direction_as_string;
+            const auto bytes = current_speed_element->total.*data_direction.bytes_ptr;
+            if (bytes != 0) {
+                graphite_data[graphite_current_prefix + ".bps"] = bytes * 8;
+            }
 
-
-            if (data_direction == INCOMING) {
-                // Prepare incoming traffic data
-
-                // We do not store zero data to Graphite
-                if (current_speed_element->total.in_packets != 0) {
-                    graphite_data[graphite_current_prefix + ".pps"] = current_speed_element->total.in_packets;
-                }
-
-                if (current_speed_element->total.in_bytes != 0) {
-                    graphite_data[graphite_current_prefix + ".bps"] = current_speed_element->total.in_bytes * 8;
-                }
-
-                if (current_speed_element->in_flows != 0) {
-                    graphite_data[graphite_current_prefix + ".flows"] = current_speed_element->in_flows;
-                }
-
-            } else if (data_direction == OUTGOING) {
-                // Prepare outgoing traffic data
-
-                // We do not store zero data to Graphite
-                if (current_speed_element->total.out_packets != 0) {
-                    graphite_data[graphite_current_prefix + ".pps"] = current_speed_element->total.out_packets;
-                }
-
-                if (current_speed_element->total.out_bytes != 0) {
-                    graphite_data[graphite_current_prefix + ".bps"] = current_speed_element->total.out_bytes * 8;
-                }
-
-                if (current_speed_element->out_flows != 0) {
-                    graphite_data[graphite_current_prefix + ".flows"] = current_speed_element->out_flows;
-                }
+            const auto flows = *current_speed_element.*data_direction.flows_ptr;
+            if (flows != 0) {
+                graphite_data[graphite_current_prefix + ".flows"] = flows;
             }
         }
     }
